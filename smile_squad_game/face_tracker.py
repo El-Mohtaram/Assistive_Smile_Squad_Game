@@ -55,40 +55,21 @@ class FaceTracker:
     _R_BROW_IDX = [300, 293, 334]
     _NOSE_TIP = [4, 5, 6]
 
+    # FIX: MediaPipe restart threshold — if process() fails or returns no
+    # landmarks for this many consecutive frames, reinitialize face_mesh.
+    _MEDIAPIPE_FAIL_LIMIT = 60
+
     def __init__(self):
-        mp_fm = mp.solutions.face_mesh
-
-        # Suppress MediaPipe C++ stderr initialization warnings (XNNPACK/absl)
-        # We keep stderr muted through constructor + a dummy .process() call
-        # to force all lazy C++ init (XNNPACK delegate, worker threads) to
-        # complete while stderr is silenced.
-        try:
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            old_stderr = os.dup(sys.stderr.fileno())
-            os.dup2(devnull, sys.stderr.fileno())
-        except Exception:
-            old_stderr = None
-
-        try:
-            self.face_mesh = mp_fm.FaceMesh(
-                max_num_faces=1,
-                refine_landmarks=True,
-                min_detection_confidence=0.60,
-                min_tracking_confidence=0.60,
-            )
-            # Dummy process to trigger XNNPACK delegate creation while muted
-            _dummy = np.zeros((100, 100, 3), dtype=np.uint8)
-            self.face_mesh.process(_dummy)
-            time.sleep(0.15)
-        finally:
-            if old_stderr is not None:
-                os.dup2(old_stderr, sys.stderr.fileno())
-                os.close(old_stderr)
-                os.close(devnull)
+        # FIX: store init params so we can reinitialize MediaPipe if needed
+        self._mp_fm = mp.solutions.face_mesh
+        self._init_facemesh()
 
         self.draw_spec = mp.solutions.drawing_utils.DrawingSpec(
             color=(0, 200, 140), thickness=1, circle_radius=1)
-        self.mp_fm = mp_fm
+        self.mp_fm = self._mp_fm
+
+        # FIX: MediaPipe consecutive failure counter
+        self._mediapipe_fail_count = 0
 
         # ── Calibration state ────────────────────────────────────────────────
         self.calibrated = False
@@ -119,6 +100,38 @@ class FaceTracker:
         self.fsi_history = []
         self.rep_log = []
         self.rep_count = {"smile": 0, "eyebrow": 0, "pucker": 0}
+
+    # FIX: extracted FaceMesh initialization into a helper so it can be called
+    # both from __init__ and from the auto-restart logic.
+    def _init_facemesh(self):
+        """Initialize (or reinitialize) the MediaPipe FaceMesh model."""
+        # Suppress MediaPipe C++ stderr initialization warnings (XNNPACK/absl)
+        # We keep stderr muted through constructor + a dummy .process() call
+        # to force all lazy C++ init (XNNPACK delegate, worker threads) to
+        # complete while stderr is silenced.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            old_stderr = os.dup(sys.stderr.fileno())
+            os.dup2(devnull, sys.stderr.fileno())
+        except Exception:
+            old_stderr = None
+
+        try:
+            self.face_mesh = self._mp_fm.FaceMesh(
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.60,
+                min_tracking_confidence=0.60,
+            )
+            # Dummy process to trigger XNNPACK delegate creation while muted
+            _dummy = np.zeros((100, 100, 3), dtype=np.uint8)
+            self.face_mesh.process(_dummy)
+            time.sleep(0.15)
+        finally:
+            if old_stderr is not None:
+                os.dup2(old_stderr, sys.stderr.fileno())
+                os.close(old_stderr)
+                os.close(devnull)
 
     # ─────────────────────────── geometry helpers ─────────────────────────────
     def _cluster(self, lms, indices, w, h):
@@ -235,14 +248,47 @@ class FaceTracker:
     def update(self, frame):
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = self.face_mesh.process(rgb)
+
+        # FIX: wrap face_mesh.process() in try/except. On exception, increment
+        # the failure counter and trigger a reinit if over the limit.
+        try:
+            res = self.face_mesh.process(rgb)
+        except Exception as e:
+            print(f"[FaceTracker] Exception during face_mesh.process: {e}")
+            import traceback
+            traceback.print_exc()
+            self._mediapipe_fail_count += 1
+            if self._mediapipe_fail_count > self._MEDIAPIPE_FAIL_LIMIT:
+                print("[FaceTracker] Fail limit reached, restarting MediaPipe...")
+                # FIX: MediaPipe is in a bad state — close and reinitialize
+                try:
+                    self.face_mesh.close()
+                except Exception:
+                    pass
+                self._init_facemesh()
+                self._mediapipe_fail_count = 0
+            self.face_detected = False
+            return frame
 
         self.face_detected = False
         if not res.multi_face_landmarks:
             self.is_still = False
             self.motion_level = 0.0
+            # FIX: increment failure counter when no landmarks are detected
+            self._mediapipe_fail_count += 1
+            if self._mediapipe_fail_count > self._MEDIAPIPE_FAIL_LIMIT:
+                # FIX: too many consecutive frames with no landmarks after
+                # camera confirmed open — reinitialize MediaPipe completely
+                try:
+                    self.face_mesh.close()
+                except Exception:
+                    pass
+                self._init_facemesh()
+                self._mediapipe_fail_count = 0
             return frame
 
+        # FIX: successful detection — reset the failure counter
+        self._mediapipe_fail_count = 0
         self.face_detected = True
         lms = res.multi_face_landmarks[0].landmark
 
@@ -326,3 +372,13 @@ class FaceTracker:
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
         return path
+
+    # ─────────────────────────── shutdown ──────────────────────────────────
+    def close(self):
+        """Release MediaPipe resources gracefully."""
+        if hasattr(self, 'face_mesh') and self.face_mesh is not None:
+            try:
+                self.face_mesh.close()
+            except Exception:
+                pass
+            self.face_mesh = None

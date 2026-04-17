@@ -254,6 +254,13 @@ class SmileSquad:
         cont = self.f_md.render("Press SPACE to retry this level", True, C_TEXT)
         self.screen.blit(cont, (SCREEN_W // 2 - cont.get_width() // 2, 360))
 
+    def _draw_loading_level(self):
+        self._draw_background()
+        msg = self.f_xl.render(f"Loading Level {self.level_num}...", True, (255, 220, 70))
+        self.screen.blit(msg, (SCREEN_W // 2 - msg.get_width() // 2, 250))
+        sub = self.f_md.render("Re-initializing camera and face AI for stability...", True, C_TEXT)
+        self.screen.blit(sub, (SCREEN_W // 2 - sub.get_width() // 2, 320))
+
     def _draw_session_end(self):
         self._draw_background()
         title = self.f_xl.render("SESSION COMPLETE!", True, (255, 220, 70))
@@ -315,8 +322,7 @@ class SmileSquad:
                                 self.state = "session_end"
                             else:
                                 self.level_num += 1
-                                self.load_level(self.level_num)
-                                self.state = "playing"
+                                self.state = "loading_level"
 
                     elif self.state == "game_over":
                         if event.key == pygame.K_SPACE:
@@ -329,6 +335,7 @@ class SmileSquad:
                             # Full restart — stop threads first
                             self._face_proc.stop()
                             self.cam_reader.release()
+                            self.tracker.close()
                             self.__class__.__init__(self)
                             break
 
@@ -361,6 +368,29 @@ class SmileSquad:
             elif self.state == "session_end":
                 self._draw_session_end()
 
+            elif self.state == "loading_level":
+                self._draw_loading_level()
+                pygame.display.flip()  # Force draw immediately
+                
+                # Heavy lifting: Reset camera pipeline to flush OS buffers
+                print(f"Loading Level {self.level_num}: Re-initializing Camera & MediaPipe...")
+                self._face_proc.stop()
+                self.cam_reader.release()
+                import time
+                
+                # CRITICAL FIX: The Windows USB driver needs at least 2-3 seconds to completely 
+                # power down the webcam endpoint and release the memory lock. 0.5s is too fast 
+                # and causes a ghost lock on the 4th/5th retry, resulting in permanent frame drops.
+                time.sleep(3.0)  
+                
+                from .camera import CameraReader, FaceProcessorThread
+                self.cam_reader = CameraReader(0)
+                self._face_proc = FaceProcessorThread(self.cam_reader, self.tracker)
+                self._face_proc.start()
+                
+                self.load_level(self.level_num)
+                self.state = "playing"
+
             # Camera overlay
             if self.state in ("playing", "calibrating", "level_complete"):
                 self._draw_camera()
@@ -371,6 +401,7 @@ class SmileSquad:
         self.tracker.save_session()
         self._face_proc.stop()
         self.cam_reader.release()
+        self.tracker.close()
         pygame.quit()
 
     # ─────────────────────────────── playing update ───────────────────────────
