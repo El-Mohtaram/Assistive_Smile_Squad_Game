@@ -373,6 +373,26 @@ class FaceTracker:
             json.dump(payload, f, indent=2)
         return path
 
+    # ─────────────────────────── level-transition reset ─────────────────────
+    def reset_mediapipe(self):
+        """
+        Lightweight reset for level transitions.
+        Reinitialises the FaceMesh model to prevent accumulated drift,
+        but preserves calibration baselines, session data, and rep counts.
+        """
+        try:
+            self.face_mesh.close()
+        except Exception:
+            pass
+        self._init_facemesh()
+        self._mediapipe_fail_count = 0
+        # Reset EMA smoothing so the first frames of the new level
+        # don't carry stale expression state from the previous level.
+        self._raw_ema = {}
+        self._expr_ema = {"smile": 0.0, "eyebrow": 0.0, "pucker": 0.0}
+        self._expr_active = {"smile": False, "eyebrow": False, "pucker": False}
+        self.expressions = {"smile": 0.0, "eyebrow": 0.0, "pucker": 0.0}
+
     # ─────────────────────────── shutdown ──────────────────────────────────
     def close(self):
         """Release MediaPipe resources gracefully."""

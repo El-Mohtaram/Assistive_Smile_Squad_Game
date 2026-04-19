@@ -10,17 +10,19 @@ from .constants import CAM_DISP_W, CAM_DISP_H
 
 class CameraReader:
     """
-    SINGLETON CameraReader.
-    
-    CRITICAL FIX: This class is now a Singleton. When game.py calls .release() 
-    and CameraReader(0) between levels, this Singleton fakes the release and 
-    returns the persistently running thread. 
-    
-    This flushes the software buffers (as requested) but NEVER power-cycles the 
-    Windows USB driver, completely eliminating the 100% Frame Dropped error!
+    SINGLETON CameraReader — opens the hardware ONCE and never releases it.
+
+    The reader thread runs for the entire lifetime of the application.
+    Between levels the game calls flush_buffer() which safely drains stale
+    frames from the software buffer WITHOUT touching the USB hardware.
+
+    The reader loop will only attempt to re-open the camera if the
+    VideoCapture object itself reports isOpened() == False, which means
+    the OS-level driver has dropped the device (e.g. USB unplug).
+    Transient cap.read() failures are simply ignored with a short sleep.
     """
     _instance = None
-    
+
     def __new__(cls, *args, **kwargs):
         if not cls._instance:
             cls._instance = super(CameraReader, cls).__new__(cls)
@@ -29,10 +31,8 @@ class CameraReader:
 
     def __init__(self, src=0):
         if self._initialized:
-            # Re-instantiated between levels! Flush the frame buffer safely.
-            with self._lock:
-                self._frame = None
-            self._fail_count = 0
+            # Re-instantiated between levels — just flush the buffer.
+            self.flush_buffer()
             return
 
         # First-time initialization
@@ -43,33 +43,45 @@ class CameraReader:
         self._running    = True
         self._fail_count = 0
         self._thread     = None
-        
-        self._open_camera()
+
+        self._open_camera(initial=True)
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
         self._initialized = True
 
-    def _open_camera(self):
+    # ── hardware helpers ──────────────────────────────────────────────────────
+    def _open_camera(self, initial=False):
+        """Open the hardware capture device.  Only prints on first open."""
         if self._cap is not None:
-            try: self._cap.release()
-            except: pass
-            
-        print("[CameraReader] Opening hardware stream (PERMANENT LOCK)...")
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+
+        if initial:
+            print("[CameraReader] Opening hardware stream...")
+
         cap = cv2.VideoCapture(self._src)
         if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             self._cap = cap
+            if not initial:
+                print("[CameraReader] Hardware stream recovered.")
         else:
-            try: cap.release()
-            except: pass
+            try:
+                cap.release()
+            except Exception:
+                pass
             self._cap = None
 
+    # ── reader thread ─────────────────────────────────────────────────────────
     def _reader_loop(self):
         while self._running:
+            # ── Guard: camera object lost (USB unplug / driver crash) ──────
             if self._cap is None or not self._cap.isOpened():
-                time.sleep(1.0)
-                self._open_camera()
+                time.sleep(2.0)  # wait before retrying
+                self._open_camera(initial=False)
                 continue
 
             ret, frame = self._cap.read()
@@ -80,34 +92,57 @@ class CameraReader:
                 self._fail_count = 0
             else:
                 self._fail_count += 1
-                time.sleep(0.033)
+                time.sleep(0.016)
                 
-                # Only log if it's actually dead, ignore normal 1-frame drops
+                # Recover from zombie states (Windows MSMF)
                 if self._fail_count >= 150:
                     print("[CameraReader] Hardware starved. Re-initializing connection...")
                     self._fail_count = 0
-                    self._open_camera()
+                    self._open_camera(initial=False)
 
+    # ── public API ────────────────────────────────────────────────────────────
     def read(self):
         with self._lock:
             if self._frame is None:
                 return None
-            # CRITICAL FIX: Consume the frame so the AI thread doesn't 
-            # re-process the exact same image and burn 100% CPU!
+            # Consume the frame so the AI thread doesn't
+            # re-process the exact same image and burn 100% CPU.
             f = self._frame.copy()
             self._frame = None
             return f
 
-    def release(self):
+    def flush_buffer(self):
         """
-        FAKE RELEASE! The game requests a release between levels to "flush" the 
-        camera. We flush our software buffers to reset the state, but we DO NOT 
-        release the hardware lock. This permanently fixes the frame dropping.
+        Safe buffer flush for level transitions.
+        Clears the latest cached frame so the face processor starts fresh.
+        Does NOT touch the hardware — the reader thread keeps running.
         """
         with self._lock:
             self._frame = None
-        self._fail_count = 0
-        # Notice we do NOT stop self._running or self._cap.
+
+    def release(self):
+        """
+        Soft release — flushes the buffer but keeps hardware open.
+        Called between levels and at session restart.
+        """
+        self.flush_buffer()
+
+    def destroy(self):
+        """
+        TRUE release — tears down the reader thread and closes hardware.
+        Only call this on application exit.
+        """
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+            self._cap = None
+        CameraReader._instance = None
+        self._initialized = False
 
 
 class FaceProcessorThread:
@@ -129,6 +164,8 @@ class FaceProcessorThread:
         self._thread     = None
 
     def start(self):
+        if self._running:
+            return  # already running — no-op
         self._running = True
         self._thread  = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -153,7 +190,7 @@ class FaceProcessorThread:
                     self._rgb_array = rgb_t
 
             except Exception as e:
-                # FIX: silently skip bad frame — thread stays alive
+                # Silently skip bad frame — thread stays alive
                 time.sleep(0.01)
                 continue
 

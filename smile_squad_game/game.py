@@ -258,7 +258,7 @@ class SmileSquad:
         self._draw_background()
         msg = self.f_xl.render(f"Loading Level {self.level_num}...", True, (255, 220, 70))
         self.screen.blit(msg, (SCREEN_W // 2 - msg.get_width() // 2, 250))
-        sub = self.f_md.render("Re-initializing camera and face AI for stability...", True, C_TEXT)
+        sub = self.f_md.render("Resetting face AI for next level...", True, C_TEXT)
         self.screen.blit(sub, (SCREEN_W // 2 - sub.get_width() // 2, 320))
 
     def _draw_session_end(self):
@@ -332,9 +332,10 @@ class SmileSquad:
 
                     elif self.state == "session_end":
                         if event.key == pygame.K_SPACE:
-                            # Full restart — stop threads first
+                            # Full restart — stop face thread, flush buffer,
+                            # reset tracker state, but keep camera hardware open.
                             self._face_proc.stop()
-                            self.cam_reader.release()
+                            self.cam_reader.flush_buffer()
                             self.tracker.close()
                             self.__class__.__init__(self)
                             break
@@ -370,25 +371,24 @@ class SmileSquad:
 
             elif self.state == "loading_level":
                 self._draw_loading_level()
-                pygame.display.flip()  # Force draw immediately
-                
-                # Heavy lifting: Reset camera pipeline to flush OS buffers
-                print(f"Loading Level {self.level_num}: Re-initializing Camera & MediaPipe...")
+                pygame.display.flip()  # Show loading screen immediately
+
+                # Light-weight level transition:
+                #  1. Pause face processing (thread exits cleanly)
+                #  2. Flush the camera's software frame buffer
+                #  3. Reset MediaPipe so it re-acquires the face fresh
+                #  4. Load the level geometry
+                #  5. Restart the face processor thread
+                # The camera HARDWARE stays open the entire time — no USB re-init.
+                print(f"Loading Level {self.level_num}: Resetting face tracker...")
                 self._face_proc.stop()
-                self.cam_reader.release()
-                import time
-                
-                # CRITICAL FIX: The Windows USB driver needs at least 2-3 seconds to completely 
-                # power down the webcam endpoint and release the memory lock. 0.5s is too fast 
-                # and causes a ghost lock on the 4th/5th retry, resulting in permanent frame drops.
-                time.sleep(3.0)  
-                
-                from .camera import CameraReader, FaceProcessorThread
-                self.cam_reader = CameraReader(0)
+                self.cam_reader.flush_buffer()
+                self.tracker.reset_mediapipe()
+
+                self.load_level(self.level_num)
+
                 self._face_proc = FaceProcessorThread(self.cam_reader, self.tracker)
                 self._face_proc.start()
-                
-                self.load_level(self.level_num)
                 self.state = "playing"
 
             # Camera overlay
@@ -397,10 +397,10 @@ class SmileSquad:
 
             pygame.display.flip()
 
-        # Cleanup
+        # Cleanup — properly tear down everything
         self.tracker.save_session()
         self._face_proc.stop()
-        self.cam_reader.release()
+        self.cam_reader.destroy()   # TRUE hardware release on app exit
         self.tracker.close()
         pygame.quit()
 
